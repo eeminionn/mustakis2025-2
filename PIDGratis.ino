@@ -26,8 +26,7 @@ uint16_t sensorValues[SensorCount];
 
 QTRSensors qtr;
 
-// ─────────── Prototipos que ya tienes en tu proyecto ───────────
-// Deben existir en tu otro archivo (no se redefinen aquí).
+// ────────────────────────────────────────────────────────────────
 void inicializarMotores();
 void Motor(int velIzq, int velDer);
 // ────────────────────────────────────────────────────────────────
@@ -52,7 +51,7 @@ void setup() {
   pinMode(LED, OUTPUT);
   pinMode(BOTON, INPUT);
 
-  // Config QTR (analógico, mismos pines que usabas)
+  // Config QTR (analógico, mismos pines)
   qtr.setTypeAnalog();
   qtr.setSensorPins((const uint8_t[]){ 36, 39, 34, 35, 32, 33, 25, 26 }, SensorCount);
   qtr.setEmitterPin(27);
