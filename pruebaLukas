@@ -1,0 +1,315 @@
+#include <QTRSensors.h>
+#include <Wire.h>
+#include <MPU6050_light.h>
+
+// Pines ESP32 para sensores y motores
+#define BOTON 12
+#define LED  2
+
+// Casos especiales (puedes mantenerlos si los usas en otra parte)
+bool primerCuadradoIzquierda  = false;
+bool primerCuadradoDerecha    = false;
+bool segundoCuadradoIzquierda = false;
+bool segundoCuadradoDerecha   = false;
+int  contadorCasosEspeciales  = 0;
+bool huboLineaCentral         = false; // flag general
+
+// Marca de cuadrado y mecánica de forzado para PRÓXIMA SEMI con línea
+int  marcaCuadradoDir   = 0;   // -1 = izquierda, +1 = derecha, 0 = sin marca
+bool tieneMarcaCuadrado = false;
+bool forzarProximaSemi  = false;
+
+// PID
+float Kp = 0.13;
+float Ki = 0.0;
+float Kd = 0.5;
+
+int lastError = 0;
+int integral  = 0;
+
+// Velocidad base de los motores
+const int velocidadBase = 50;
+
+// PWM para ESP32 (no modifico tu setup de motores)
+const int freq       = 5000;
+const int resolution = 8;
+const int canalA     = 0;
+const int canalB     = 1;
+
+// Estado de giro (si no usas estas flags, no pasa nada)
+bool izquierda = true;
+bool derecha   = true;
+
+// Flags para detección de cruce (en escáner)
+bool flagIzquierda = false;
+bool flagDerecha   = false;
+unsigned long tiempoInicioEvaluacion = 0;
+
+// Sensores
+const uint8_t SensorCount = 8;
+uint16_t sensorValues[SensorCount];
+
+QTRSensors qtr;
+MPU6050 mpu(Wire);
+
+// ------------------ MPU ------------------
+void inicializarMPU() {
+  mpu.begin();
+  Serial.println("Calibrando giroscopio...");
+  mpu.calcGyroOffsets();
+  Serial.println("Sensor listo.");
+}
+
+bool sensoresEnBlanco() {
+  for (uint8_t i = 0; i < SensorCount; i++) {
+    if (sensorValues[i] > 4000) return false;
+  }
+  return true;
+}
+
+// ==================== GIROS 90° LINEALES (sin suavizado) ====================
+
+void girarDerecha90() {
+  Motor(0, 0);
+  delay(30);
+  for (int i = 0; i < 10; i++) { mpu.update(); delay(5); }
+
+  const float objetivo = 90.0f;
+  const int   margen   = 2;       // tolerancia en grados
+  const int   pwm      = 45;      // PWM fijo para el giro
+  const uint16_t timeout_ms = 2000;
+
+  float anguloInicio = mpu.getAngleZ();
+  float anguloActual = anguloInicio;
+  unsigned long t0 = millis();
+
+  while (true) {
+    mpu.update();
+    anguloActual = mpu.getAngleZ();
+
+    // derecha = delta negativo → progreso = -delta
+    float delta    = anguloActual - anguloInicio;
+    float progreso = -delta;
+
+    if (progreso >= (objetivo - margen)) break;
+    if (millis() - t0 > timeout_ms) { Serial.println("Timeout giro derecha"); break; }
+
+    Motor(-pwm, pwm);
+    delay(8);
+  }
+
+  Motor(0, 0);
+  derecha = false;
+  mpu.calcGyroOffsets();
+}
+
+void girarIzquierda90() {
+  Motor(0, 0);
+  delay(30);
+  for (int i = 0; i < 10; i++) { mpu.update(); delay(5); }
+
+  const float objetivo = 90.0f;
+  const int   margen   = 2;
+  const int   pwm      = 45;
+  const uint16_t timeout_ms = 2000;
+
+  float anguloInicio = mpu.getAngleZ();
+  float anguloActual = anguloInicio;
+  unsigned long t0 = millis();
+
+  while (true) {
+    mpu.update();
+    anguloActual = mpu.getAngleZ();
+
+    // izquierda = delta positivo
+    float delta = anguloActual - anguloInicio;
+
+    if (delta >= (objetivo - margen)) break;
+    if (millis() - t0 > timeout_ms) { Serial.println("Timeout giro izquierda"); break; }
+
+    Motor(pwm, -pwm);
+    delay(8);
+  }
+
+  Motor(0, 0);
+  izquierda = false;
+  mpu.calcGyroOffsets();
+}
+
+// =================================================================
+
+void PID(uint16_t position) {
+  int error = position - 3500;
+  integral += error;
+  int derivative = error - lastError;
+  int output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+  lastError = error;
+
+  int velocidadIzquierda = constrain(velocidadBase + output, 0, 255);
+  int velocidadDerecha   = constrain(velocidadBase - output, 0, 255);
+  Motor(velocidadIzquierda, velocidadDerecha);
+}
+
+// ==================== Intersecciones con marcas y forzado de PRÓXIMA SEMI ====================
+void evaluarCruce() {
+  // Umbrales
+  const int TH_LADO   = 4000; // extremos (0 y 7)
+  const int TH_CENTRO = 3200; // centrales (2..5) para "hay línea al frente"
+
+  // (2) Retroceder
+  Motor(-50, -50);
+  delay(400);
+  Motor(0, 0);
+  delay(100);
+
+  // (3) Avanzar ESCANEANDO para clasificar
+  bool vioIzq = false, vioDer = false, vioCentroDuranteScan = false;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 1000) {
+    qtr.read(sensorValues);
+    if (sensorValues[0] > TH_LADO) vioIzq = true;
+    if (sensorValues[7] > TH_LADO) vioDer = true;
+    for (int i = 2; i <= 5; i++) {
+      if (sensorValues[i] > TH_CENTRO) { vioCentroDuranteScan = true; break; }
+    }
+    Motor(50, 50);   // avance suave de confirmación
+    delay(10);
+  }
+
+  // (4) Detenerse
+  Motor(0, 0);
+  delay(100);
+
+  // (5) Revisar si hay línea al frente (lectura estática final)
+  qtr.read(sensorValues);
+  bool hayLineaFinal = false;
+  for (int i = 2; i <= 5; i++) {
+    if (sensorValues[i] > TH_CENTRO) { hayLineaFinal = true; break; }
+  }
+
+  // (6) Tomar decisión
+
+  // --- SEMI-INTERSECCIÓN (solo un lado) ---
+  if (vioIzq ^ vioDer) {
+    if (hayLineaFinal) {
+      // Si hay orden pendiente: FORZAR giro en esta semi (según la semi actual)
+      if (forzarProximaSemi) {
+        if (vioIzq)  { girarIzquierda90(); }
+        else         { girarDerecha90(); }
+        forzarProximaSemi = false;  // consumir la orden
+        return;
+      }
+
+      // Si NO hay forzado: NO girar → guardar marca y volver a PID
+      if (vioIzq)  { marcaCuadradoDir = -1; }
+      if (vioDer)  { marcaCuadradoDir = +1; }
+      tieneMarcaCuadrado = true;
+
+      Motor(50, 50);
+      delay(200);
+      Motor(0, 0);
+      return; // volver al PID
+    } else {
+      // SEMI sin línea → giro normal inmediato
+      if (vioIzq)  { girarIzquierda90(); return; }
+      if (vioDer)  { girarDerecha90();  return; }
+    }
+  }
+
+  // --- INTERSECCIÓN COMPLETA (ambos lados) ---
+  if (vioIzq && vioDer) {
+    if (!hayLineaFinal) {
+      // COMPLETA y SIN línea: usar marca de cuadrado si existe
+      if (tieneMarcaCuadrado && marcaCuadradoDir != 0) {
+        if (marcaCuadradoDir < 0) girarIzquierda90();
+        else                       girarDerecha90();
+
+        // limpiar marca y preparar “forzar PRÓXIMA SEMI con línea”
+        tieneMarcaCuadrado = false;
+        forzarProximaSemi  = true;
+        return;
+      } else {
+        // *** NUEVO: Final sin marcas → detener 5 segundos y terminar ***
+        Motor(0, 0);
+        delay(5000);
+        while (true) {} // fin
+      }
+    } else {
+      // COMPLETA con línea → comportamiento normal: recto un poco
+      Motor(50, 50); delay(200); Motor(0, 0);
+      return;
+    }
+  }
+
+  // --- Nada concluyente ---
+  Motor(0, 0);
+  while (true) {}
+}
+
+// ------------------ Setup / Loop ------------------
+void setup() {
+  Serial.begin(115200);
+  inicializarMotores();  // Definida por ti en tu otro archivo
+
+  pinMode(LED, OUTPUT);
+  pinMode(BOTON, INPUT);
+
+  qtr.setTypeAnalog();
+  qtr.setSensorPins((const uint8_t[]){ 36, 39, 34, 35, 32, 33, 25, 26 }, SensorCount);
+  qtr.setEmitterPin(27);
+
+  Serial.println("Esperando boton para calibrar");
+  while (digitalRead(BOTON) == LOW) delay(10);
+
+  Serial.println("Calibrando sensores...");
+  for (uint16_t i = 0; i < 150; i++) qtr.calibrate();
+
+  Wire.begin();
+  inicializarMPU();
+
+  while (digitalRead(BOTON) == LOW) delay(10);
+  delay(1000);
+}
+
+void loop() {
+  qtr.read(sensorValues);
+
+  // Filtrado simple para el cálculo de posición
+  for (uint8_t i = 0; i < SensorCount; i++) {
+    if (sensorValues[i] < 3500) sensorValues[i] = 0;
+  }
+
+  // Posición manual ponderada
+  uint32_t sumaPesada = 0;
+  uint32_t sumaTotal  = 0;
+  for (uint8_t i = 0; i < SensorCount; i++) {
+    sumaPesada += (uint32_t)sensorValues[i] * (i * 1000);
+    sumaTotal  += sensorValues[i];
+  }
+  uint16_t position = (sumaTotal > 0) ? (sumaPesada / sumaTotal) : 0;
+
+  // ---- NUEVO: manejo de GAPS (todo blanco) ----
+  if (sumaTotal == 0) {
+    // Avanza recto con velocidad base para no “morir” en líneas segmentadas
+    Motor(velocidadBase -10, velocidadBase -10);
+    // Evita acumular integral/derivativos inútiles
+    integral = 0;
+    lastError = 0;
+    // No corremos PID en esta iteración
+    return;
+  }
+
+  // Disparador de cruce por extremos
+  static int contadorCruce = 0;
+  if (sensorValues[0] > 4000 || sensorValues[7] > 4000) contadorCruce++;
+  else contadorCruce = 0;
+
+  if (contadorCruce > 3) {
+    evaluarCruce();
+    contadorCruce = 0;
+    return;
+  }
+
+  // Seguimiento de línea normal
+  PID(position);
+}
